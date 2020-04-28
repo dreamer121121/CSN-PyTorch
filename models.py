@@ -1,81 +1,92 @@
+import torch.nn as nn
+from transforms import *
+from torch.nn.init import normal_, constant_
+
 # Channel Separated Convolutional Network (CSN) as presented in Video Classification with Channel-Separated Convolutional Networks(https://arxiv.org/pdf/1904.02811v4.pdf)
 # replace 3x3x3 convolution with 1x1x1 conv + 3x3x3 depthwise convolution (ip) or with 3x3x3 depthwise convolution (ir)
+
+__all__ = ['resnet26','resnet50','resnet101','resnet152']
 
 import torch
 import torch.nn as nn
 
-        
+
 class CSNBottleneck(nn.Module):
     expansion = 4
-    
+
     def __init__(self, in_channels, channels, stride=1, mode='ip'):
-        super().__init__()
-        
+        super(CSNBottleneck, self).__init__()
         assert mode in ['ip', 'ir']
         self.mode = mode
-        
+
         self.conv1 = nn.Conv3d(in_channels, channels, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm3d(channels)
         self.relu = nn.ReLU(inplace=True)
-        
+
         conv2 = []
         if self.mode == 'ip':
             conv2.append(nn.Conv3d(channels, channels, kernel_size=1, stride=1, bias=False))
-        conv2.append(nn.Conv3d(channels, channels, kernel_size=3, stride=stride, padding=1, bias=False, groups=channels))
+
+        # 逐通道的卷积
+        conv2.append(
+            nn.Conv3d(channels, channels, kernel_size=3, stride=stride, padding=1, bias=False, groups=channels))
         self.conv2 = nn.Sequential(*conv2)
         self.bn2 = nn.BatchNorm3d(channels)
-        
+
         self.conv3 = nn.Conv3d(channels, channels * self.expansion, kernel_size=1, bias=False)
         self.bn3 = nn.BatchNorm3d(channels * self.expansion)
-        
+
         self.downsample = nn.Sequential()
+        # 注意需要downsample的条件。
         if stride != 1 or in_channels != channels * self.expansion:
             self.downsample = nn.Sequential(
                 nn.Conv3d(in_channels, channels * self.expansion, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm3d(channels * self.expansion)
             )
-        
+
     def forward(self, x):
         shortcut = self.downsample(x)
 
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
-        
+
         out = self.conv2(out)
         out = self.bn2(out)
         out = self.relu(out)
-        
+
         out = self.conv3(out)
         out = self.bn3(out)
-            
+
         out += shortcut
         out = self.relu(out)
-        
+
         return out
 
 
 class CSN(nn.Module):
-    def __init__(self, block, layers, num_classes, mode='ip'):
+    def __init__(self, block, layers, num_classes, mode='ip',target_transforms=None):
         super().__init__()
-        
+
         assert mode in ['ip', 'ir']
-        self.mode = mode
-        
+        self.mode = mode  # 选取模型
+        self.target_transforms = target_transforms
+
         self.in_channels = 64
         self.conv1 = nn.Conv3d(3, 64, kernel_size=(3, 7, 7), stride=(1, 2, 2), padding=(1, 3, 3), bias=False)
         self.bn1 = nn.BatchNorm3d(64)
         self.relu = nn.ReLU(inplace=True)
         self.max_pool = nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1))
-        
+
+        # Conv2_x,Layers中记录的是该组block的个数
         self.layer1 = self._make_layer(block, 64, layers[0], stride=1)
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
-        
+
         self.avg_pool = nn.AdaptiveAvgPool3d(1)
         self.fc = nn.Linear(512 * block.expansion, num_classes)
-        
+
         # initialize
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
@@ -83,7 +94,7 @@ class CSN(nn.Module):
             elif isinstance(m, nn.BatchNorm3d):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
-                
+
     def _make_layer(self, block, channels, n_blocks, stride=1):
         assert n_blocks > 0, "number of blocks should be greater than zero"
         layers = []
@@ -91,11 +102,11 @@ class CSN(nn.Module):
         self.in_channels = channels * block.expansion
         for i in range(1, n_blocks):
             layers.append(block(self.in_channels, channels, mode=self.mode))
-        
+
         return nn.Sequential(*layers)
-    
+
     def forward(self, x, debug=False):
-        
+
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
@@ -104,7 +115,7 @@ class CSN(nn.Module):
         out = self.max_pool(out)
         if debug:
             print("shape2:", out.shape)
-        
+
         out = self.layer1(out)
         if debug:
             print("shape3:", out.shape)
@@ -117,29 +128,43 @@ class CSN(nn.Module):
         out = self.layer4(out)
         if debug:
             print("shape6:", out.shape)
-        
+
         out = self.avg_pool(out)
         if debug:
             print("shape7:", out.shape)
-        
+
         out = out.view(out.size(0), -1)
         out = self.fc(out)
-        
+
         return out
 
 
-def csn26(num_classes, mode='ip'):
-    return CSN(CSNBottleneck, [1,2,4,1], num_classes=num_classes, mode=mode)
+    @property
+    def crop_size(self):
+        return self.input_size
+
+    @property
+    def scale_size(self):
+        return self.input_size * self.init_crop_size // self.input_size
+
+    def get_augmentation(self):
+        return torchvision.transforms.Compose([GroupMultiScaleCrop(self.input_size, [1, .875, .75, .66]),
+                                               GroupRandomHorizontalFlip(self.target_transforms)])
 
 
-def csn50(num_classes, mode='ip'):
-    return CSN(CSNBottleneck, [3,4,6,3], num_classes=num_classes, mode=mode)
+
+def resnet26(num_classes, mode='ip',target_transforms=None):
+    return CSN(CSNBottleneck, [1, 2, 4, 1], num_classes=num_classes, mode=mode,target_transforms=target_transforms)
 
 
-def csn101(num_classes, mode='ip'):
-    return CSN(CSNBottleneck, [3,4,23,3], num_classes=num_classes, mode=mode)
+def resnet50(num_classes, mode='ip',target_transforms=None):
+    return CSN(CSNBottleneck, [3, 4, 6, 3], num_classes=num_classes, mode=mode,target_transforms=target_transforms)
 
 
-def csn152(num_classes):
-    return CSN(CSNBottleneck, [3,8,36,3], num_classes=num_classes)
-    
+def resnet101(num_classes, mode='ip',target_transforms=None):
+    return CSN(CSNBottleneck, [3, 4, 23, 3], num_classes=num_classes, mode=mode,target_transforms=target_transforms)
+
+
+def resnet152(num_classes,mode='ip',target_transforms=None):
+    return CSN(CSNBottleneck, [3, 8, 36, 3], num_classes=num_classes,mode=mode,target_transforms=target_transforms)
+
